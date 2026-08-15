@@ -20,6 +20,10 @@ fn main() {
                         println!("        Type: USB");
                         println!("        VID: {:04x}", info.vid);
                         println!("        PID: {:04x}", info.pid);
+                        #[cfg(feature = "usbportinfo-location")]
+                        if let Some(location) = info.location {
+                            println!("        Location: {}", location);
+                        }
                         #[cfg(feature = "usbportinfo-interface")]
                         println!(
                             "        Interface: {}",

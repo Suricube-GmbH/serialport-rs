@@ -36,6 +36,8 @@
 use std::error::Error as StdError;
 use std::fmt;
 use std::io;
+#[cfg(feature = "usbportinfo-location")]
+use std::num::{IntErrorKind, ParseIntError};
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -334,6 +336,9 @@ pub struct SerialPortBuilder {
     timeout: Duration,
     /// The state to set DTR to when opening the device
     dtr_on_open: Option<bool>,
+    /// Whether to enforce exclusive access to the port
+    #[cfg(unix)]
+    exclusive: bool,
 }
 
 impl SerialPortBuilder {
@@ -413,6 +418,18 @@ impl SerialPortBuilder {
     #[must_use]
     pub fn preserve_dtr_on_open(mut self) -> Self {
         self.dtr_on_open = None;
+        self
+    }
+
+    /// Set whether the port should be opened with exclusive access.
+    ///
+    /// By default, ports are opened with exclusive access. This is what you typically want as
+    /// opening and accessing the very same port multiple times results in garbled data on or from
+    /// the wire.
+    #[cfg(unix)]
+    #[must_use]
+    pub fn exclusive(mut self, exclusive: bool) -> Self {
+        self.exclusive = exclusive;
         self
     }
 
@@ -810,11 +827,148 @@ pub struct UsbPortInfo {
     pub manufacturer: Option<String>,
     /// Product name (arbitrary string)
     pub product: Option<String>,
+    /// Physical port heirarchy
+    #[cfg(feature = "usbportinfo-location")]
+    pub location: Option<Location>,
     /// The interface index of the USB serial port. This can be either the interface number of
     /// the communication interface (as is the case on Windows and Linux) or the data
     /// interface (as is the case on macOS), so you should recognize both interface numbers.
     #[cfg(feature = "usbportinfo-interface")]
     pub interface: Option<u8>,
+}
+
+#[cfg(feature = "usbportinfo-location")]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+/// Identify where a particular USB device is on the system.
+pub struct Location {
+    bus_id: String,
+    port_chain: Vec<u8>,
+}
+
+#[cfg(feature = "usbportinfo-location")]
+impl Location {
+    /// Create a new USB device location based on some string identifying the bus number, along with
+    /// the path taken to a particular port.
+    pub fn new(bus_id: String, port_chain: Vec<u8>) -> Self {
+        Location { bus_id, port_chain }
+    }
+
+    /// Returns `true` if this Location is located below another Location in the bus hierarchy.
+    pub fn is_descendant_of(&self, other: &Location) -> bool {
+        self.bus_id == other.bus_id
+            && self.port_chain.starts_with(&other.port_chain)
+            && self.port_chain != other.port_chain
+    }
+
+    /// Returns the ID of the bus.
+    pub fn bus_id(&self) -> &str {
+        &self.bus_id
+    }
+
+    /// Returns a Vec of the port numbers needed to be traversed to get to this device.
+    pub fn port_chain(&self) -> &[u8] {
+        &self.port_chain
+    }
+
+    /// Returns the parent of this device, if any. Root objects have no parent.
+    pub fn parent(&self) -> Option<Location> {
+        if self.port_chain.len() <= 1 {
+            None
+        } else {
+            Some(Location {
+                bus_id: self.bus_id.clone(),
+                port_chain: self.port_chain[0..self.port_chain.len() - 1].to_owned(),
+            })
+        }
+    }
+}
+
+#[cfg(feature = "usbportinfo-location")]
+impl fmt::Display for Location {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> std::fmt::Result {
+        // Use a location format similat to Linux' sysfs 'bus-port.port[....]'.
+        //
+        // TODO: Switch to Iterator::intersperse when it get stabilized and available to us.
+        let port_chain = self
+            .port_chain
+            .iter()
+            .map(|p| p.to_string())
+            .collect::<Vec<_>>()
+            .join(".");
+        write!(f, "{}-{}", self.bus_id, port_chain)
+    }
+}
+
+/// An error which can be returned when parsing a USB device location string.
+#[cfg(feature = "usbportinfo-location")]
+// TODO: Derive Hash when our MSRV gives us an `IntErrorKind` implementing it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ParseLocationError {
+    kind: LocationErrorKind,
+}
+
+#[cfg(feature = "usbportinfo-location")]
+impl ParseLocationError {
+    /// Returns the detailed cause for parsing a USB device location failing.
+    pub fn kind(&self) -> &LocationErrorKind {
+        &self.kind
+    }
+}
+
+/// Enum to store the various types of errors that can cause parsing a USB device locaiton to fail.
+#[cfg(feature = "usbportinfo-location")]
+// TODO: Derive Hash when our MSRV gives us an `IntErrorKind` implementing it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum LocationErrorKind {
+    /// Parsing a port number in the port chain failed.
+    Port(IntErrorKind),
+    /// Parsing the top-level structure failed.
+    TopLevel,
+}
+
+#[cfg(feature = "usbportinfo-location")]
+impl From<ParseIntError> for ParseLocationError {
+    fn from(error: ParseIntError) -> ParseLocationError {
+        // TODO: Switch to copying instead of cloning of ParseIntError once this is supported on our
+        // MSRV too.
+        #[allow(clippy::clone_on_copy)]
+        ParseLocationError {
+            kind: LocationErrorKind::Port(error.kind().clone()),
+        }
+    }
+}
+
+#[cfg(feature = "usbportinfo-location")]
+impl FromStr for Location {
+    type Err = ParseLocationError;
+
+    fn from_str(s: &str) -> std::result::Result<Location, Self::Err> {
+        let mut splits = s.split('-');
+
+        if let (Some(bus_id), Some(port_chain), None) =
+            (splits.next(), splits.next(), splits.next())
+        {
+            let bus_id = String::from(bus_id);
+            // We need to handle an empty port chain explicitly because otherwise the `split` would
+            // result in an empty port string for which parsing would fail.
+            let port_chain = if port_chain.is_empty() {
+                Vec::new()
+            } else {
+                port_chain
+                    .split('.')
+                    .map(|p| p.parse())
+                    .collect::<std::result::Result<Vec<u8>, _>>()?
+            };
+
+            Ok(Location { bus_id, port_chain })
+        } else {
+            Err(ParseLocationError {
+                kind: LocationErrorKind::TopLevel,
+            })
+        }
+    }
 }
 
 struct HexU16(u16);
@@ -833,6 +987,11 @@ impl std::fmt::Debug for UsbPortInfo {
             .field("serial_number", &self.serial_number)
             .field("manufacturer", &self.manufacturer)
             .field("product", &self.product);
+
+        #[cfg(feature = "usbportinfo-location")]
+        {
+            d.field("location", &self.location);
+        }
 
         #[cfg(feature = "usbportinfo-interface")]
         {
@@ -894,6 +1053,8 @@ pub fn new<'a>(path: impl Into<std::borrow::Cow<'a, str>>, baud_rate: u32) -> Se
         // substantially larger area than the one benefitting from it, I finally decided to revert
         // this. Sorry for this back and forth, Christian.
         dtr_on_open: None,
+        #[cfg(unix)]
+        exclusive: true,
     }
 }
 
@@ -934,6 +1095,22 @@ mod test {
         assert_eq!(builder.stop_bits, StopBits::One);
         assert_eq!(builder.timeout, Duration::ZERO);
         assert_eq!(builder.dtr_on_open, None);
+        #[cfg(unix)]
+        assert!(builder.exclusive);
+    }
+
+    // Checks that the builder's exclusive method changes the state accordingly.
+    #[cfg(unix)]
+    #[rstest]
+    fn builder_exclusive() {
+        let builder = new("port_test_dummy", 12345);
+        assert!(builder.exclusive);
+
+        let builder = builder.exclusive(false);
+        assert!(!builder.exclusive);
+
+        let builder = builder.exclusive(true);
+        assert!(builder.exclusive);
     }
 
     #[rstest]
@@ -944,6 +1121,8 @@ mod test {
             pid: 0xaffe,
             product: Some(String::from("your product here")),
             serial_number: Some(String::from("your serial_number here")),
+            #[cfg(feature = "usbportinfo-location")]
+            location: Some(Location::new(String::from("001"), vec![1, 2, 3])),
             #[cfg(feature = "usbportinfo-interface")]
             interface: Some(42),
         };
@@ -951,11 +1130,200 @@ mod test {
 
         // Set the expectiation for the debug representation basend on a "snapshot" of the current
         // one, manually cross-checked to contain a VID and PID in hexadecimal digits.
-        #[cfg(not(feature = "usbportinfo-interface"))]
-        let expected = "UsbPortInfo { vid: 0xbade, pid: 0xaffe, serial_number: Some(\"your serial_number here\"), manufacturer: Some(\"your manufacutrer here\"), product: Some(\"your product here\") }";
+        //
+        // Due to having multiple configuration variants, we are building the expectation depending
+        // on the currently selected preview features.
+        let mut expected = String::from("UsbPortInfo { vid: 0xbade, pid: 0xaffe, serial_number: Some(\"your serial_number here\"), manufacturer: Some(\"your manufacutrer here\"), product: Some(\"your product here\")");
+        #[cfg(feature = "usbportinfo-location")]
+        {
+            expected += ", location: Some(Location { bus_id: \"001\", port_chain: [1, 2, 3] })";
+        }
         #[cfg(feature = "usbportinfo-interface")]
-        let expected = "UsbPortInfo { vid: 0xbade, pid: 0xaffe, serial_number: Some(\"your serial_number here\"), manufacturer: Some(\"your manufacutrer here\"), product: Some(\"your product here\"), interface: Some(42) }";
+        {
+            expected += ", interface: Some(42)";
+        }
+        expected += " }";
 
         assert_eq!(formatted, expected);
+    }
+
+    #[cfg(feature = "usbportinfo-location")]
+    mod usbportinfo_location {
+        use super::*;
+
+        // Empty fields are corner cases when we are not restricting the input inputs to
+        // `Location::new`. Let's have some test to ensure that they behave at least in a defined
+        // manner.
+        #[rstest]
+        #[case(Location { bus_id: String::new(), port_chain: vec![] }, "-")]
+        #[case(Location { bus_id: String::from("1"), port_chain: vec![] }, "1-")]
+        #[case(Location { bus_id: String::new(), port_chain: vec![1] }, "-1")]
+        fn display_empty_fields(#[case] location: Location, #[case] display: &str) {
+            assert_eq!(format!("{}", location), display);
+        }
+
+        #[rstest]
+        #[case(Location { bus_id: String::from("bus"), port_chain: vec![1, 2, 3]})]
+        #[case(Location { bus_id: String::from("1"), port_chain: vec![1, 2, 3]})]
+        #[case(Location { bus_id: String::from("001"), port_chain: vec![1, 2, 3]})]
+        fn display_from_str_cycle(#[case] start: Location) {
+            let display = format!("{}", start);
+            let from_str = Location::from_str(&display).unwrap();
+
+            assert_eq!(start, from_str);
+        }
+
+        #[rstest]
+        fn display_simple() {
+            let location = Location {
+                bus_id: String::from("bus"),
+                port_chain: vec![1, 2, 3],
+            };
+
+            assert_eq!(format!("{}", location), "bus-1.2.3",)
+        }
+
+        // Empty fields are corner cases when we are not restricting the input inputs to
+        // `Location::new`. Let's have some test to ensure that they behave at least in a defined
+        // manner.
+        #[rstest]
+        #[case("-", Location { bus_id: String::new(), port_chain: vec![]})]
+        #[case("1-", Location { bus_id: String::from("1"), port_chain: vec![]})]
+        #[case("-1", Location { bus_id: String::new(), port_chain: vec![1]})]
+        fn from_str_empty_fields(#[case] from: &str, #[case] location: Location) {
+            assert_eq!(Location::from_str(from).unwrap(), location);
+        }
+
+        #[rstest]
+        fn from_str_simple() {
+            assert_eq!(
+                Location::from_str("bus-1").unwrap(),
+                Location {
+                    bus_id: String::from("bus"),
+                    port_chain: vec![1],
+                }
+            );
+
+            assert_eq!(
+                Location::from_str("bus-255").unwrap(),
+                Location {
+                    bus_id: String::from("bus"),
+                    port_chain: vec![255],
+                }
+            );
+
+            assert_eq!(
+                Location::from_str("bus-1.2.3.4.5").unwrap(),
+                Location {
+                    bus_id: String::from("bus"),
+                    port_chain: vec![1, 2, 3, 4, 5],
+                }
+            );
+        }
+
+        #[rstest]
+        fn from_str_simple_invalid() {
+            matches!(
+                Location::from_str("").unwrap_err().kind(),
+                LocationErrorKind::TopLevel
+            );
+            matches!(
+                Location::from_str("bus").unwrap_err().kind(),
+                LocationErrorKind::TopLevel
+            );
+            matches!(
+                Location::from_str("bus-a").unwrap_err().kind(),
+                LocationErrorKind::Port(_)
+            );
+            matches!(
+                Location::from_str("bus-256").unwrap_err().kind(),
+                LocationErrorKind::Port(_)
+            );
+            matches!(
+                Location::from_str("bus-1-1").unwrap_err().kind(),
+                LocationErrorKind::TopLevel
+            );
+            matches!(
+                Location::from_str("bus-1..2").unwrap_err().kind(),
+                LocationErrorKind::TopLevel
+            );
+            matches!(
+                Location::from_str("bus-1.2.").unwrap_err().kind(),
+                LocationErrorKind::TopLevel
+            );
+        }
+
+        #[rstest]
+        fn is_descendand_of() {
+            let child = Location {
+                bus_id: String::from("bus"),
+                port_chain: vec![1, 2, 3],
+            };
+            let parent = Location {
+                bus_id: String::from("bus"),
+                port_chain: vec![1, 2],
+            };
+            let grandparent = Location {
+                bus_id: String::from("bus"),
+                port_chain: vec![1],
+            };
+            let empty_port_chain = Location {
+                bus_id: String::from("bus"),
+                port_chain: vec![],
+            };
+
+            assert!(child.is_descendant_of(&empty_port_chain));
+            assert!(parent.is_descendant_of(&empty_port_chain));
+            assert!(grandparent.is_descendant_of(&empty_port_chain));
+            assert!(!empty_port_chain.is_descendant_of(&empty_port_chain));
+
+            assert!(child.is_descendant_of(&grandparent));
+            assert!(parent.is_descendant_of(&grandparent));
+            assert!(!grandparent.is_descendant_of(&grandparent));
+            assert!(!empty_port_chain.is_descendant_of(&grandparent));
+
+            assert!(child.is_descendant_of(&parent));
+            assert!(!parent.is_descendant_of(&parent));
+            assert!(!grandparent.is_descendant_of(&parent));
+            assert!(!empty_port_chain.is_descendant_of(&parent));
+
+            assert!(!child.is_descendant_of(&child));
+            assert!(!parent.is_descendant_of(&child));
+            assert!(!grandparent.is_descendant_of(&child));
+            assert!(!empty_port_chain.is_descendant_of(&child));
+
+            let different_parent = Location {
+                bus_id: String::from("another_bus"),
+                port_chain: vec![1, 2],
+            };
+
+            assert!(!child.is_descendant_of(&different_parent));
+        }
+
+        #[rstest]
+        fn parent() {
+            let child = Location {
+                bus_id: String::from("bus"),
+                port_chain: vec![1, 2, 3],
+            };
+            let parent = Location {
+                bus_id: String::from("bus"),
+                port_chain: vec![1, 2],
+            };
+            let grandparent = Location {
+                bus_id: String::from("bus"),
+                port_chain: vec![1],
+            };
+            let empty_port_chain = Location {
+                bus_id: String::from("bus"),
+                port_chain: vec![1],
+            };
+
+            assert_eq!(child.parent(), Some(parent.clone()));
+            assert_eq!(parent.parent(), Some(grandparent.clone()));
+
+            assert!(grandparent.parent().is_none());
+            assert!(empty_port_chain.parent().is_none());
+        }
     }
 }

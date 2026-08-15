@@ -4,6 +4,7 @@ on:
   pull_request:
     branches:
       - main
+      - playground-5.0
   push:
   # Check for new issues from updated dependencies once a week (Friday noon).
   schedule:
@@ -12,34 +13,75 @@ on:
 
 jobs:
   # --------------------------------------------------------------------------
-  # LINT
+  # Formatting
 
-  lint:
+  fmt:
     runs-on: ubuntu-latest
     steps:
-      - name: Lint | install dependencies
-        run: |
-          sudo sed -i 's/azure.archive.ubuntu.com/archive.ubuntu.com/' /etc/apt/sources.list
-          sudo apt-get -qq update
-          sudo apt install -qq -y libudev-dev
+        # TODO: Harmonize with build.yaml
+      - name: Fmt | checkout
+        uses: actions/checkout@v6
 
-      - name: Lint | checkout
-        uses: actions/checkout@v2
-
-      - name: Lint | install toolchain
+      - name: Fmt | install toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
           components: clippy, rustfmt
 
-      - name: Lint | rust-cache
+      - name: Fmt | rust-cache
         uses: Swatinem/rust-cache@v2
 
-      - name: Lint | check formatting
+      - name: Fmt | check formatting
         run: cargo fmt -- --check
 
-      - name: Lint | clippy
-        run: cargo clippy --all-targets --all-features
+  # --------------------------------------------------------------------------
+  # Clippy lints
+
+  clippy:
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: -Dwarnings
+    strategy:
+      matrix:
+        target:
+          - aarch64-apple-darwin
+          - arm-linux-androideabi
+          - x86_64-pc-windows-msvc
+          - x86_64-unknown-freebsd
+          - x86_64-unknown-linux-gnu
+          - x86_64-unknown-netbsd
+      fail-fast: false
+    steps:
+      # TODO: Harmonize with build.yaml
+      - run: |
+          sudo sed -i 's/azure.archive.ubuntu.com/archive.ubuntu.com/' /etc/apt/sources.list
+          sudo apt-get -qq update
+          sudo apt install -qq -y libudev-dev
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          target: ${{ matrix.target }}
+      - uses: swatinem/rust-cache@v2
+        # Pin some dependencies (for Clippy and our MSRV 1.59.0) just here in
+        # CI and not via Cargo.toml. The latter would enforce them to all users
+        # and not just the ones who want to build with an old Rust release. See
+        # issue https://github.com/serialport/serialport-rs/issues/324.
+        #
+        # The command line arguments below are for Cargo 1.59.0. The have
+        # changed with newer releases and need to be adjusted when bumbing our
+        # MSRV.
+        #
+        # NOTE: Please keep in sync with pinning for build jobs in build.yaml.
+      - name: Build | pin some dependencies for building with MSRV
+        run: |
+          cargo update --precise 0.10.0 --package core-foundation
+          cargo update --precise 0.2.163 --package libc
+          cargo update --precise 1.0.101 --package proc-macro2
+          cargo update --precise 1.0.40 --package quote
+          cargo update --precise 1.0.22 --package unicode-ident
+      - run: cargo clippy --target ${{ matrix.target }}
+      - run: cargo clippy --target ${{ matrix.target }} --all-features
+
 
   # --------------------------------------------------------------------------
   # Rustdoc
@@ -51,11 +93,12 @@ jobs:
       RUSTDOCFLAGS: -Dwarnings
     steps:
       - name: documentation | install dependencies
+        # TODO: Harmonize with build.yaml
         run: |
           sudo sed -i 's/azure.archive.ubuntu.com/archive.ubuntu.com/' /etc/apt/sources.list
           sudo apt-get -qq update
           sudo apt install -qq -y libudev-dev
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@nightly
       - uses: dtolnay/install@cargo-docs-rs
       - run: cargo docs-rs
@@ -67,7 +110,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Links | checkout
-        uses: actions/checkout@v2
+        uses: actions/checkout@v6
 
       - name: Links | check
         id: lychee
@@ -87,6 +130,7 @@ jobs:
       disable_tests: true
       target: aarch64-apple-darwin
       toolchain: "1.59.0"
+      pin-incompatible-msrv-bump-dependencies: true
 
   msrv-arm-linux-androideabi:
     uses: ./.github/workflows/build.yaml
@@ -95,6 +139,7 @@ jobs:
       disable_tests: true
       target: arm-linux-androideabi
       toolchain: "1.59.0"
+      pin-incompatible-msrv-bump-dependencies: true
 
   msrv-x86_64-unknown-freebsd:
     uses: ./.github/workflows/build.yaml
@@ -103,6 +148,7 @@ jobs:
       disable_tests: true
       target: x86_64-unknown-freebsd
       toolchain: "1.59.0"
+      pin-incompatible-msrv-bump-dependencies: true
 
   msrv-x86_64-unknown-linux-gnu:
     uses: ./.github/workflows/build.yaml
@@ -112,6 +158,7 @@ jobs:
       extra_packages: libudev-dev
       target: x86_64-unknown-linux-gnu
       toolchain: "1.59.0"
+      pin-incompatible-msrv-bump-dependencies: true
 
   msrv-x86_64-unknown-linux-musl:
     uses: ./.github/workflows/build.yaml
@@ -121,6 +168,7 @@ jobs:
       extra_packages: gcc-aarch64-linux-gnu
       target: aarch64-unknown-linux-musl
       toolchain: "1.59.0"
+      pin-incompatible-msrv-bump-dependencies: true
 
   msrv-x86_64-pc-windows-msvc:
     uses: ./.github/workflows/build.yaml
@@ -130,6 +178,7 @@ jobs:
       runs_on: windows-2025
       target: x86_64-pc-windows-msvc
       toolchain: "1.59.0"
+      pin-incompatible-msrv-bump-dependencies: true
 
   msrv-x86_64-unknown-netbsd:
     uses: ./.github/workflows/build.yaml
@@ -138,6 +187,7 @@ jobs:
       disable_tests: true
       target: x86_64-unknown-netbsd
       toolchain: "1.59.0"
+      pin-incompatible-msrv-bump-dependencies: true
 
   # --------------------------------------------------------------------------
   # Semantic Versioning
@@ -161,20 +211,20 @@ jobs:
           - "only-explicit-features"
           - "all-features"
     steps:
-    - run: |
-        # TODO: Harmonize with build.yaml
-        sudo sed -i 's/azure.archive.ubuntu.com/archive.ubuntu.com/' /etc/apt/sources.list
-        sudo apt-get -qq update
-        sudo apt-get -qq -y install build-essential curl git pkg-config libudev-dev
-    - uses: actions/checkout@v2
-    - uses: dtolnay/rust-toolchain@stable
-      with:
-        target: ${{ matrix.target }}
-    - uses: Swatinem/rust-cache@v2
-    - uses: obi1kenobi/cargo-semver-checks-action@v2
-      with:
-        rust-target: ${{ matrix.target }}
-        feature-group: ${{ matrix.feature-group }}
+      # TODO: Harmonize with build.yaml
+      - run: |
+          sudo sed -i 's/azure.archive.ubuntu.com/archive.ubuntu.com/' /etc/apt/sources.list
+          sudo apt-get -qq update
+          sudo apt-get -qq -y install build-essential curl git pkg-config libudev-dev
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          target: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - uses: obi1kenobi/cargo-semver-checks-action@v2
+        with:
+          rust-target: ${{ matrix.target }}
+          feature-group: ${{ matrix.feature-group }}
 
   # --------------------------------------------------------------------------
   # cargo-deny
@@ -191,7 +241,7 @@ jobs:
     continue-on-error: ${{ matrix.checks == 'advisories' }}
 
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v6
     - uses: EmbarkStudios/cargo-deny-action@v2
       with:
         command: check ${{ matrix.checks }}

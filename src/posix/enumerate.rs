@@ -109,6 +109,55 @@ fn udev_restore_spaces(source: String) -> String {
     source.replace('_', " ")
 }
 
+#[cfg(all(
+    target_os = "linux",
+    not(target_env = "musl"),
+    all(feature = "libudev", feature = "usbportinfo-location")
+))]
+/// Get the bus number and port chain out of the first parent device that
+/// has a defined bus number.
+fn port_location(device: &libudev::Device) -> Option<crate::Location> {
+    let mut device = device.parent();
+    while let Some(d) = device.take() {
+        let busnum = udev_property_as_string(&d, "BUSNUM");
+        let devpath = d.devpath().and_then(OsStr::to_str);
+        device = d.parent();
+
+        // TODO: Replace this with `if let Some(busnum) = busnum else { continue };`
+        // when MSRV is updated.
+        if busnum.is_none() {
+            continue;
+        }
+        let busnum = busnum.unwrap();
+
+        // TODO: Replace this with `if let Some(devpath) = devpath else { continue };`
+        // when MSRV is updated.
+        if devpath.is_none() {
+            continue;
+        };
+        let devpath = devpath.unwrap();
+
+        let bus_num = busnum.parse().map(|n: u32| format!("{n}"));
+
+        let port_chain = devpath
+            .rsplit_once("-")
+            .map(|s| s.1)
+            .filter(|p| *p != "0") // root hub should be empty but devpath is 0
+            .and_then(|p| {
+                p.split('.')
+                    .map(|v| v.parse::<u8>().ok())
+                    .collect::<Option<Vec<u8>>>()
+            });
+
+        return match (bus_num, port_chain) {
+            (Ok(bus_id), Some(port_chain)) => Some(crate::Location::new(bus_id, port_chain)),
+            _ => None,
+        };
+    }
+
+    None
+}
+
 #[cfg(all(target_os = "linux", not(target_env = "musl"), feature = "libudev"))]
 fn port_type(d: &libudev::Device) -> Result<SerialPortType> {
     match d.property_value("ID_BUS").and_then(OsStr::to_str) {
@@ -123,12 +172,18 @@ fn port_type(d: &libudev::Device) -> Result<SerialPortType> {
             let product =
                 udev_property_encoded_or_replaced_as_string(d, "ID_MODEL_ENC", "ID_MODEL")
                     .or_else(|| udev_property_as_string(d, "ID_MODEL_FROM_DATABASE"));
+
+            #[cfg(feature = "usbportinfo-location")]
+            let location = port_location(d);
+
             Ok(SerialPortType::UsbPort(UsbPortInfo {
                 vid: udev_hex_property_as_int(d, "ID_VENDOR_ID", &u16::from_str_radix)?,
                 pid: udev_hex_property_as_int(d, "ID_MODEL_ID", &u16::from_str_radix)?,
                 serial_number,
                 manufacturer,
                 product,
+                #[cfg(feature = "usbportinfo-location")]
+                location,
                 #[cfg(feature = "usbportinfo-interface")]
                 interface: udev_hex_property_as_int(d, "ID_USB_INTERFACE_NUM", &u8::from_str_radix)
                     .ok(),
@@ -154,12 +209,18 @@ fn port_type(d: &libudev::Device) -> Result<SerialPortType> {
                     "ID_USB_MODEL_ENC",
                     "ID_USB_MODEL",
                 );
+
+                #[cfg(feature = "usbportinfo-location")]
+                let location = port_location(d);
+
                 Ok(SerialPortType::UsbPort(UsbPortInfo {
                     vid: udev_hex_property_as_int(d, "ID_USB_VENDOR_ID", &u16::from_str_radix)?,
                     pid: udev_hex_property_as_int(d, "ID_USB_MODEL_ID", &u16::from_str_radix)?,
                     serial_number: udev_property_as_string(d, "ID_USB_SERIAL_SHORT"),
                     manufacturer,
                     product,
+                    #[cfg(feature = "usbportinfo-location")]
+                    location,
                     #[cfg(feature = "usbportinfo-interface")]
                     interface: udev_hex_property_as_int(
                         d,
@@ -253,6 +314,8 @@ fn parse_modalias(moda: &str) -> Option<UsbPortInfo> {
         serial_number: None,
         manufacturer: None,
         product: None,
+        #[cfg(feature = "usbportinfo-location")]
+        location: None,
         // Only attempt to find the interface if the feature is enabled.
         #[cfg(feature = "usbportinfo-interface")]
         interface: mod_tail.get(pid_start + 4..).and_then(|mod_tail| {
@@ -345,6 +408,40 @@ fn get_string_property(device_type: io_registry_entry_t, property: &str) -> Resu
         .ok_or(Error::new(ErrorKind::Unknown, "Failed to get string value"))
 }
 
+#[cfg(all(
+    any(target_os = "ios", target_os = "macos"),
+    feature = "usbportinfo-location"
+))]
+impl crate::Location {
+    /// Creates a `Location` from a location ID from Apple's I/O registry.
+    ///
+    /// There is no information from Apple on this format. This is how [nusb's
+    /// `parse_location_id`](https://github.com/kevinmehall/nusb/blob/e9343c3c6ccd227206631015098b2f27b7e3ec5f/src/platform/macos_iokit/enumeration.rs#L276)
+    /// interprets it:
+    ///
+    /// The format of the ID is expected to be in the form of `0xBBPPPPPP` where `BB` is the bus ID
+    /// and `P` a nibble containing a port number. USB allows ub to 5 hubs between the root hub and
+    /// the device and so the location ID can capture the entire port chain. Trailing port numbers
+    /// of zero will be ignored.
+    pub fn from_location_id(id: u32) -> crate::Location {
+        let bytes = id.to_be_bytes();
+
+        let bus_id = format!("{}", bytes[0]);
+
+        // Convert remaining bytes into nibbles and trim trailing zeroes. When trailing zeroes are
+        // not used, I would have expected zeroes in between non-zero ports to be invalid. But this
+        // is how nusb does it and I'm leaving it this way for the time being.
+        let mut ports: Vec<u8> = bytes[1..].iter().flat_map(|b| [b >> 4, b & 0xf]).collect();
+        if let Some(last_populated) = ports.iter().rposition(|n| *n != 0) {
+            ports.truncate(last_populated + 1);
+        } else {
+            ports.clear();
+        }
+
+        crate::Location::new(bus_id, ports)
+    }
+}
+
 #[cfg(any(target_os = "ios", target_os = "macos"))]
 /// Determine the serial port type based on the service object (like that returned by
 /// `IOIteratorNext`). Specific properties are extracted for USB devices.
@@ -362,6 +459,10 @@ fn port_type(service: io_object_t) -> SerialPortType {
             serial_number: get_string_property(usb_device, "USB Serial Number").ok(),
             manufacturer: get_string_property(usb_device, "USB Vendor Name").ok(),
             product: get_string_property(usb_device, "USB Product Name").ok(),
+            #[cfg(feature = "usbportinfo-location")]
+            location: get_int_property(usb_device, "locationID")
+                .ok()
+                .map(crate::Location::from_location_id),
             // Apple developer documentation indicates `bInterfaceNumber` is the supported key for
             // looking up the composite usb interface id. `idVendor` and `idProduct` are included in the same tables, so
             // we will lookup the interface number using the same method. See:
@@ -567,6 +668,26 @@ cfg_if! {
             u8::from_str_radix(&read_file_to_trimmed_string(dir, file)?, 16).ok()
         }
 
+        #[cfg(feature = "usbportinfo-location")]
+        fn read_location(dir: &Path) -> Option<crate::Location> {
+            let bus_id = read_file_to_trimmed_string(dir, "busnum")
+                .and_then(|s| u32::from_str_radix(&s, 10).ok())
+                .map(|n| format!("{n}"));
+
+            let port_chain = read_file_to_trimmed_string(dir, "devpath")
+                .filter(|p| p != "0") // root hub should be empty but devpath is 0
+                .and_then(|p| {
+                    p.split('.')
+                        .map(|v| v.parse::<u8>().ok())
+                        .collect::<Option<Vec<u8>>>()
+                });
+
+            match (bus_id, port_chain) {
+                (Some(bus_id), Some(port_chain)) => Some(crate::Location::new(bus_id, port_chain)),
+                _ => None,
+            }
+        }
+
         fn read_port_type(path: &Path) -> Option<SerialPortType> {
             let path = path
                 .canonicalize()
@@ -594,13 +715,15 @@ cfg_if! {
         fn read_usb_port_info(interface_path: &Path) -> Option<UsbPortInfo> {
             let device_path = interface_path.parent()?;
 
-            let vid = read_file_to_u16(&device_path, "idVendor")?;
-            let pid = read_file_to_u16(&device_path, "idProduct")?;
+            let vid = read_file_to_u16(device_path, "idVendor")?;
+            let pid = read_file_to_u16(device_path, "idProduct")?;
+            #[cfg(feature = "usbportinfo-location")]
+            let location = read_location(device_path)?;
             #[cfg(feature = "usbportinfo-interface")]
-            let interface = read_file_to_u8(&interface_path, &"bInterfaceNumber");
-            let serial_number = read_file_to_trimmed_string(&device_path, &"serial");
-            let product = read_file_to_trimmed_string(&device_path, &"product");
-            let manufacturer = read_file_to_trimmed_string(&device_path, &"manufacturer");
+            let interface = read_file_to_u8(interface_path, "bInterfaceNumber");
+            let serial_number = read_file_to_trimmed_string(device_path, "serial");
+            let product = read_file_to_trimmed_string(device_path, "product");
+            let manufacturer = read_file_to_trimmed_string(device_path, "manufacturer");
 
             Some(UsbPortInfo {
                 vid,
@@ -608,6 +731,8 @@ cfg_if! {
                 serial_number,
                 manufacturer,
                 product,
+                #[cfg(feature = "usbportinfo-location")]
+                location: Some(location),
                 #[cfg(feature = "usbportinfo-interface")]
                 interface,
             })
@@ -674,13 +799,13 @@ cfg_if! {
                 let path = path?;
                 let filename = path.file_name();
                 let filename_string = filename.to_string_lossy();
-                if filename_string.starts_with("cuaU") || filename_string.starts_with("cuau") || filename_string.starts_with("cuad") {
-                    if !filename_string.ends_with(".init") && !filename_string.ends_with(".lock") {
-                        vec.push(SerialPortInfo {
-                            port_name: path.path().to_string_lossy().to_string(),
-                            port_type: SerialPortType::Unknown,
-                        });
-                    }
+                if (filename_string.starts_with("cuaU") || filename_string.starts_with("cuau") || filename_string.starts_with("cuad"))
+                    && !filename_string.ends_with(".init") && !filename_string.ends_with(".lock")
+                {
+                    vec.push(SerialPortInfo {
+                        port_name: path.path().to_string_lossy().to_string(),
+                        port_type: SerialPortType::Unknown,
+                    });
                 }
             }
             Ok(vec)

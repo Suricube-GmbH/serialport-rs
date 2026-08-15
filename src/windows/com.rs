@@ -46,7 +46,7 @@ impl COMPort {
     /// ## Errors
     ///
     /// * `NoDevice` if the device could not be opened. This could indicate that
-    ///    the device is already in use.
+    ///   the device is already in use.
     /// * `InvalidInput` if `port` is not a valid device name.
     /// * `Io` for any other I/O error while opening or initializing the device.
     pub fn open(builder: &SerialPortBuilder) -> Result<COMPort> {
@@ -59,11 +59,13 @@ impl COMPort {
         name.extend(builder.path.encode_utf16());
         name.push(0);
 
+        let share_mode = 0;
+
         let handle = unsafe {
             CreateFileW(
                 name.as_ptr(),
                 GENERIC_READ | GENERIC_WRITE,
-                0,
+                share_mode,
                 ptr::null_mut(),
                 OPEN_EXISTING,
                 FILE_ATTRIBUTE_NORMAL,

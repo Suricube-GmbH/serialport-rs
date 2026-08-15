@@ -1,5 +1,5 @@
 [![crates.io version badge](https://img.shields.io/crates/v/serialport.svg)](https://crates.io/crates/serialport)
-[![Documentation](https://docs.rs/serialport/badge.svg)](https://docs.rs/serialport)
+[![Documentation](https://img.shields.io/docsrs/serialport/latest)](https://docs.rs/serialport)
 [![GitHub workflow status](https://img.shields.io/github/actions/workflow/status/serialport/serialport-rs/ci.yaml?branch=main&logo=github)](https://github.com/serialport/serialport-rs/actions)
 [![Minimum Stable Rust Version](https://img.shields.io/badge/Rust-1.59.0-blue?logo=rust)](https://blog.rust-lang.org/2022/02/24/Rust-1.59.0.html)
 
@@ -131,6 +131,15 @@ feature):
 
 - Ubuntu: `sudo apt install libudev-dev`
 - Fedora: `sudo dnf install systemd-devel`
+
+We no longer pin dependencies of to versions compatible with our MSRV. This has
+created issues with failing dependency resolution for many users building with
+newer Rust versions (see issue
+[#324](https://github.com/serialport/serialport-rs/issues/324) for details). If
+you are building with and older Rust version down to our MSRV, you might want
+to pin such dependencies in your project to a working version with `cargo
+update --precise`. See [`build.yaml`](.github/workflows/build.yaml#L99) of an
+actual list of dependencies for our CI builds.
 
 # Platform Support
 
